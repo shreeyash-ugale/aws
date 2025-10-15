@@ -122,10 +122,22 @@ func (t *TokenStore) List(ctx context.Context) ([]TokenRecord, error) {
 func (t *TokenStore) Validate(token string) bool {
 	// Ensure we have a cache; lazy-load on first use to avoid per-request S3 calls
 	if len(t.cache) == 0 {
-		_ = t.load(context.Background())
+		if err := t.load(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: token validation failed to load cache: %v\n", err)
+			return false
+		}
 	}
+
+	if len(t.cache) == 0 {
+		fmt.Fprintf(os.Stderr, "Warning: token cache is empty after load\n")
+		return false
+	}
+
 	h := sha256.Sum256([]byte(token))
 	hh := hex.EncodeToString(h[:])
+
+	now := time.Now().Unix()
+
 	for _, r := range t.cache {
 		if r.Revoked {
 			continue
@@ -141,7 +153,8 @@ func (t *TokenStore) Validate(token string) bool {
 			exp = r.CreatedAt + int64(defaultTokenTTL.Seconds())
 		}
 		if exp > 0 {
-			if time.Now().Unix() > exp {
+			if now > exp {
+				fmt.Fprintf(os.Stderr, "Token expired: now=%d, exp=%d\n", now, exp)
 				continue
 			}
 		}
@@ -160,9 +173,23 @@ func (t *TokenStore) Middleware(next http.Handler) http.Handler {
 			http.Error(w, "missing token", http.StatusUnauthorized)
 			return
 		}
-		tok := strings.TrimSpace(auth[len("Bearer "):])
-		// load latest tokens from S3 in background; ignore error to avoid latency
-		_ = t.load(r.Context())
+		// Extract token - handle both "Bearer " and "bearer " case-insensitively
+		tok := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		tok = strings.TrimSpace(strings.TrimPrefix(tok, "bearer "))
+
+		if tok == "" {
+			http.Error(w, "missing token", http.StatusUnauthorized)
+			return
+		}
+
+		// Load latest tokens from S3 before validation
+		// This ensures we check against the current token list
+		if err := t.load(r.Context()); err != nil {
+			// If load fails, try to validate with cached tokens
+			// but log the error for debugging
+			fmt.Fprintf(os.Stderr, "Warning: failed to load tokens from S3: %v\n", err)
+		}
+
 		if !t.Validate(tok) {
 			http.Error(w, "invalid or expired token", http.StatusForbidden)
 			return
