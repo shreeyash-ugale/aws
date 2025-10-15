@@ -67,7 +67,11 @@ func (s *S3Store) Upload(ctx context.Context, id string, r io.Reader, contentTyp
 }
 
 func (s *S3Store) Download(ctx context.Context, id string, w http.ResponseWriter) error {
-	key := fmt.Sprintf("files/%s.bin", id)
+	// Allow callers to pass either a bare id (e.g., "myfile.txt") or a full key (e.g., "files/myfile.txt.bin")
+	key := id
+	if !(strings.HasPrefix(key, "files/") && strings.HasSuffix(strings.ToLower(key), ".bin")) {
+		key = fmt.Sprintf("files/%s.bin", id)
+	}
 	out, err := s.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "not found") {

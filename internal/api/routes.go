@@ -124,6 +124,52 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 		json.NewEncoder(w).Encode(storedRec)
 	})
 
+	// Token-protected download route supporting either raw id or full object key
+	r.Group(func(gr chi.Router) {
+		gr.Use(tokens.Middleware)
+		// GET /download/{id} -> expects bare id, decrypts and streams
+		gr.Get("/download/{id}", func(w http.ResponseWriter, r *http.Request) {
+			id := chi.URLParam(r, "id")
+			if id == "" {
+				http.Error(w, "missing id", http.StatusBadRequest)
+				return
+			}
+			if err := store.Download(r.Context(), id, w); err != nil {
+				status := http.StatusInternalServerError
+				if strings.Contains(strings.ToLower(err.Error()), "not found") {
+					status = http.StatusNotFound
+				}
+				http.Error(w, err.Error(), status)
+				return
+			}
+			if metaStore != nil {
+				// increment using canonical key
+				_, _ = metaStore.IncrementAccess(r.Context(), fmt.Sprintf("files/%s.bin", id))
+			}
+		})
+
+		// GET /download/key/* catches full S3 key after /download/key/
+		gr.Get("/download/key/*", func(w http.ResponseWriter, r *http.Request) {
+			wild := chi.URLParam(r, "*")
+			key := strings.TrimPrefix(wild, "/")
+			if key == "" {
+				http.Error(w, "missing key", http.StatusBadRequest)
+				return
+			}
+			if err := store.Download(r.Context(), key, w); err != nil {
+				status := http.StatusInternalServerError
+				if strings.Contains(strings.ToLower(err.Error()), "not found") {
+					status = http.StatusNotFound
+				}
+				http.Error(w, err.Error(), status)
+				return
+			}
+			if metaStore != nil {
+				_, _ = metaStore.IncrementAccess(r.Context(), key)
+			}
+		})
+	})
+
 	// Admin endpoints
 	r.Group(func(ar chi.Router) {
 		ar.Use(func(next http.Handler) http.Handler { return auth.AdminMiddleware(cfg.AdminToken, next) })
