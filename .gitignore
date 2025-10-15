@@ -1,0 +1,22 @@
+# Go
+bin/
+dist/
+*.exe
+*.log
+*.out
+*.test
+
+# IDE
+.vscode/
+.idea/
+
+# Terraform
+infra/terraform/.terraform/
+infra/terraform/.terraform.lock.hcl
+terraform.tfvars
+*.tfstate
+*.tfstate.*
+
+# Local
+.env
+*.tmp

@@ -1,0 +1,14 @@
+.git
+.gitignore
+.vscode
+.idea
+bin
+dist
+*.log
+infra
+*.tfstate*
+.terraform/
+.env
+terraform.tfvars
+**/*.test
+**/*_test.go
