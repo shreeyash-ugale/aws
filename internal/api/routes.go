@@ -133,13 +133,13 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 			json.NewEncoder(w).Encode(list)
 		})
 		ar.Post("/admin/tokens", func(w http.ResponseWriter, r *http.Request) {
-			id, token, err := tokens.CreateToken(r.Context())
+			id, token, exp, err := tokens.CreateToken(r.Context())
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]string{"id": id, "token": token})
+			json.NewEncoder(w).Encode(map[string]any{"id": id, "token": token, "expiresAt": exp})
 		})
 		ar.Post("/admin/tokens/{id}/revoke", func(w http.ResponseWriter, r *http.Request) {
 			id := chi.URLParam(r, "id")
