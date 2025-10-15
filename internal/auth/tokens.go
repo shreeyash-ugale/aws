@@ -2,56 +2,54 @@ package auth
 
 import (
 	"context"
-	crand "crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/golang-jwt/jwt/v5"
 )
 
+// TokenRecord represents metadata about an issued JWT token
 type TokenRecord struct {
 	ID        string `json:"id"`
-	Hash      string `json:"hash"`
-	CreatedAt int64  `json:"createdAt"`
-	ExpiresAt int64  `json:"expiresAt,omitempty"`
+	IssuedAt  int64  `json:"issuedAt"`
+	ExpiresAt int64  `json:"expiresAt"`
 	Revoked   bool   `json:"revoked"`
 }
 
+// TokenClaims represents the JWT claims structure
+type TokenClaims struct {
+	TokenID string `json:"jti"`
+	jwt.RegisteredClaims
+}
+
 type TokenStore struct {
-	s3     *s3.Client
-	bucket string
-	key    string
-	cache  map[string]TokenRecord
+	s3        *s3.Client
+	bucket    string
+	key       string
+	jwtSecret []byte
+	cache     map[string]TokenRecord
 }
 
-func NewTokenStore(s3c *s3.Client, bucket string) *TokenStore {
-	return &TokenStore{s3: s3c, bucket: bucket, key: "config/tokens.json", cache: map[string]TokenRecord{}}
-}
-
-// defaultTokenTTL defines how long a token remains valid from creation
-var defaultTokenTTL = 24 * time.Hour
-
-func init() {
-	if v := os.Getenv("TOKEN_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			defaultTokenTTL = d
-			return
-		}
-	}
-	if v := os.Getenv("TOKEN_TTL_HOURS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			defaultTokenTTL = time.Duration(n) * time.Hour
-		}
+// NewTokenStore creates a new JWT-based token store
+// jwtSecret should be the ADMIN token from environment
+func NewTokenStore(s3c *s3.Client, bucket string, jwtSecret string) *TokenStore {
+	return &TokenStore{
+		s3:        s3c,
+		bucket:    bucket,
+		key:       "config/tokens.json",
+		jwtSecret: []byte(jwtSecret),
+		cache:     map[string]TokenRecord{},
 	}
 }
+
+// defaultTokenTTL defines how long a JWT token remains valid from creation
+const defaultTokenTTL = 24 * time.Hour
 
 func (t *TokenStore) load(ctx context.Context) error {
 	out, err := t.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: &t.bucket, Key: &t.key})
@@ -78,27 +76,56 @@ func (t *TokenStore) save(ctx context.Context) error {
 		list = append(list, r)
 	}
 	b, _ := json.MarshalIndent(list, "", "  ")
-	_, err := t.s3.PutObject(ctx, &s3.PutObjectInput{Bucket: &t.bucket, Key: &t.key, Body: strings.NewReader(string(b)), ContentType: ptr("application/json")})
+	_, err := t.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      &t.bucket,
+		Key:         &t.key,
+		Body:        strings.NewReader(string(b)),
+		ContentType: ptr("application/json"),
+	})
 	return err
 }
 
+// CreateToken generates a new JWT token with 24h validity
 func (t *TokenStore) CreateToken(ctx context.Context) (id string, token string, expiresAt int64, err error) {
 	_ = t.load(ctx)
-	id = fmt.Sprintf("tok_%d", time.Now().UnixNano())
-	// token 32 bytes random hex
-	b := make([]byte, 32)
-	if _, err := crand.Read(b); err != nil {
-		return "", "", 0, err
-	}
-	token = hex.EncodeToString(b)
-	h := sha256.Sum256([]byte(token))
+
 	now := time.Now()
-	expiresAt = now.Add(defaultTokenTTL).Unix()
-	t.cache[id] = TokenRecord{ID: id, Hash: hex.EncodeToString(h[:]), CreatedAt: now.Unix(), ExpiresAt: expiresAt}
+	expiryTime := now.Add(defaultTokenTTL)
+	expiresAt = expiryTime.Unix()
+
+	// Generate unique token ID
+	id = fmt.Sprintf("tok_%d", now.UnixNano())
+
+	// Create JWT claims
+	claims := TokenClaims{
+		TokenID: id,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(expiryTime),
+			Issuer:    "secureFile",
+		},
+	}
+
+	// Create and sign the token
+	jwtToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	token, err = jwtToken.SignedString(t.jwtSecret)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("failed to sign JWT: %w", err)
+	}
+
+	// Store token metadata
+	t.cache[id] = TokenRecord{
+		ID:        id,
+		IssuedAt:  now.Unix(),
+		ExpiresAt: expiresAt,
+		Revoked:   false,
+	}
+
 	err = t.save(ctx)
 	return
 }
 
+// Revoke marks a token as revoked
 func (t *TokenStore) Revoke(ctx context.Context, id string) error {
 	_ = t.load(ctx)
 	rec, ok := t.cache[id]
@@ -110,6 +137,7 @@ func (t *TokenStore) Revoke(ctx context.Context, id string) error {
 	return t.save(ctx)
 }
 
+// List returns all token records
 func (t *TokenStore) List(ctx context.Context) ([]TokenRecord, error) {
 	_ = t.load(ctx)
 	list := make([]TokenRecord, 0, len(t.cache))
@@ -119,53 +147,46 @@ func (t *TokenStore) List(ctx context.Context) ([]TokenRecord, error) {
 	return list, nil
 }
 
-func (t *TokenStore) Validate(token string) bool {
-	// Ensure we have a cache; lazy-load on first use to avoid per-request S3 calls
+// Validate verifies a JWT token's signature and checks if it's revoked
+func (t *TokenStore) Validate(tokenString string) bool {
+	// Parse and validate JWT token
+	claims := &TokenClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		// Verify signing method
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return t.jwtSecret, nil
+	})
+
+	if err != nil {
+		return false
+	}
+
+	if !token.Valid {
+		return false
+	}
+
+	// Load token metadata to check revocation status
 	if len(t.cache) == 0 {
 		if err := t.load(context.Background()); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: token validation failed to load cache: %v\n", err)
 			return false
 		}
 	}
 
-	if len(t.cache) == 0 {
-		fmt.Fprintf(os.Stderr, "Warning: token cache is empty after load\n")
-		return false
+	// Check if token is revoked
+	if rec, ok := t.cache[claims.TokenID]; ok {
+		if rec.Revoked {
+			return false
+		}
 	}
 
-	h := sha256.Sum256([]byte(token))
-	hh := hex.EncodeToString(h[:])
-
-	now := time.Now().Unix()
-
-	for _, r := range t.cache {
-		if r.Revoked {
-			continue
-		}
-		if r.Hash != hh {
-			continue
-		}
-		// Determine expiry: prefer explicit ExpiresAt; otherwise derive from CreatedAt
-		var exp int64
-		if r.ExpiresAt > 0 {
-			exp = r.ExpiresAt
-		} else if r.CreatedAt > 0 {
-			exp = r.CreatedAt + int64(defaultTokenTTL.Seconds())
-		}
-		if exp > 0 {
-			if now > exp {
-				fmt.Fprintf(os.Stderr, "Token expired: now=%d, exp=%d\n", now, exp)
-				continue
-			}
-		}
-		return true
-	}
-	return false
+	return true
 }
 
 func ptr[T any](v T) *T { return &v }
 
-// Middleware for bearer token auth
+// Middleware for JWT bearer token authentication
 func (t *TokenStore) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
@@ -173,6 +194,7 @@ func (t *TokenStore) Middleware(next http.Handler) http.Handler {
 			http.Error(w, "missing token", http.StatusUnauthorized)
 			return
 		}
+
 		// Extract token - handle both "Bearer " and "bearer " case-insensitively
 		tok := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
 		tok = strings.TrimSpace(strings.TrimPrefix(tok, "bearer "))
@@ -183,7 +205,7 @@ func (t *TokenStore) Middleware(next http.Handler) http.Handler {
 		}
 
 		// Load latest tokens from S3 before validation
-		// This ensures we check against the current token list
+		// This ensures we check against the current revocation list
 		if err := t.load(r.Context()); err != nil {
 			// If load fails, try to validate with cached tokens
 			// but log the error for debugging
@@ -194,6 +216,7 @@ func (t *TokenStore) Middleware(next http.Handler) http.Handler {
 			http.Error(w, "invalid or expired token", http.StatusForbidden)
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }

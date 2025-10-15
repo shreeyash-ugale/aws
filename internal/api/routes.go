@@ -28,7 +28,7 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 	}
 	cipher := crypto.NewEnvelopeCipher(clients.KMS, cfg.KMSKeyID)
 	store := storage.NewS3Store(clients.S3, cfg.Bucket, cipher)
-	tokens := auth.NewTokenStore(clients.S3, cfg.Bucket)
+	tokens := auth.NewTokenStore(clients.S3, cfg.Bucket, cfg.AdminToken)
 
 	// Optional DynamoDB metadata store
 	var metaStore *metadata.Store
