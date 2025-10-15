@@ -73,10 +73,21 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 		})
 		gr.Get("/files/{id}", func(w http.ResponseWriter, r *http.Request) {
 			id := chi.URLParam(r, "id")
-			if err := store.Download(r.Context(), id, w); err != nil {
-				http.Error(w, err.Error(), http.StatusNotFound)
+			if id == "" {
+				http.Error(w, "missing id", http.StatusBadRequest)
 				return
 			}
+
+			if err := store.Download(r.Context(), id, w); err != nil {
+				log.Printf("Download error for id=%s: %v", id, err)
+				status := http.StatusInternalServerError
+				if strings.Contains(strings.ToLower(err.Error()), "not found") {
+					status = http.StatusNotFound
+				}
+				http.Error(w, err.Error(), status)
+				return
+			}
+
 			if metaStore != nil {
 				// increment access counter
 				_, _ = metaStore.IncrementAccess(r.Context(), fmt.Sprintf("files/%s.bin", id))
@@ -134,7 +145,9 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 				http.Error(w, "missing id", http.StatusBadRequest)
 				return
 			}
+
 			if err := store.Download(r.Context(), id, w); err != nil {
+				log.Printf("Download error for id=%s: %v", id, err)
 				status := http.StatusInternalServerError
 				if strings.Contains(strings.ToLower(err.Error()), "not found") {
 					status = http.StatusNotFound
@@ -142,6 +155,7 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 				http.Error(w, err.Error(), status)
 				return
 			}
+
 			if metaStore != nil {
 				// increment using canonical key
 				_, _ = metaStore.IncrementAccess(r.Context(), fmt.Sprintf("files/%s.bin", id))
@@ -156,7 +170,9 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 				http.Error(w, "missing key", http.StatusBadRequest)
 				return
 			}
+
 			if err := store.Download(r.Context(), key, w); err != nil {
+				log.Printf("Download error for key=%s: %v", key, err)
 				status := http.StatusInternalServerError
 				if strings.Contains(strings.ToLower(err.Error()), "not found") {
 					status = http.StatusNotFound
@@ -164,6 +180,7 @@ func RegisterRoutes(r *chi.Mux, cfg *config.Config) {
 				http.Error(w, err.Error(), status)
 				return
 			}
+
 			if metaStore != nil {
 				_, _ = metaStore.IncrementAccess(r.Context(), key)
 			}
